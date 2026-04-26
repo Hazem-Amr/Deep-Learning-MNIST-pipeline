@@ -5,6 +5,8 @@ Features:
     - Draw a digit on the canvas and get a prediction
     - Upload an image file for recognition
     - Loads the best saved model from logs/best_model/
+    - Advanced MNIST-aligned preprocessing (bbox, crop, center-of-mass)
+    - Preview panel showing what the model actually sees
 
 Usage:
     1. First run the pipeline:  python -m src.main
@@ -18,9 +20,12 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageOps, ImageTk
 import tensorflow as tf
 
+from src.utils.preprocessor import preprocess_drawn_image, get_debug_images
+
 
 # -- Constants ---------------------------------------------------------
 CANVAS_SIZE = 280          # Drawing canvas (pixels)
+PREVIEW_SIZE = 112         # Preview display (28x28 upscaled 4x)
 MNIST_SIZE = 28            # MNIST image dimension
 MODEL_PATH = os.path.join("logs", "best_model", "model.keras")
 
@@ -29,6 +34,7 @@ CANVAS_BG = "#000000"      # Black canvas (like MNIST)
 ACCENT = "#89b4fa"         # Blue accent
 TEXT_COLOR = "#cdd6f4"      # Light text
 RESULT_COLOR = "#a6e3a1"   # Green for results
+DIM_TEXT = "#6c7086"        # Dimmed text
 BTN_BG = "#313244"
 BTN_ACTIVE = "#45475a"
 BRUSH_COLOR = "white"
@@ -100,9 +106,13 @@ class DigitRecognizerApp:
         )
         subtitle.pack(pady=(0, 12))
 
-        # Canvas frame
-        canvas_frame = tk.Frame(self.root, bg=ACCENT, padx=2, pady=2)
-        canvas_frame.pack()
+        # -- Main area: Drawing canvas + Preview panel ------------------
+        main_frame = tk.Frame(self.root, bg=BG_COLOR)
+        main_frame.pack(padx=16)
+
+        # Drawing canvas (left side)
+        canvas_frame = tk.Frame(main_frame, bg=ACCENT, padx=2, pady=2)
+        canvas_frame.grid(row=0, column=0)
 
         self.canvas = tk.Canvas(
             canvas_frame,
@@ -113,6 +123,52 @@ class DigitRecognizerApp:
             highlightthickness=0,
         )
         self.canvas.pack()
+
+        # Preview panel (right side) -- shows what the model sees
+        preview_outer = tk.Frame(main_frame, bg=BG_COLOR)
+        preview_outer.grid(row=0, column=1, padx=(16, 0), sticky="n")
+
+        preview_title = tk.Label(
+            preview_outer,
+            text="Model Input",
+            font=("Segoe UI", 10, "bold"),
+            fg=DIM_TEXT,
+            bg=BG_COLOR,
+        )
+        preview_title.pack(pady=(0, 4))
+
+        preview_border = tk.Frame(preview_outer, bg=ACCENT, padx=2, pady=2)
+        preview_border.pack()
+
+        self.preview_canvas = tk.Canvas(
+            preview_border,
+            width=PREVIEW_SIZE,
+            height=PREVIEW_SIZE,
+            bg=CANVAS_BG,
+            highlightthickness=0,
+        )
+        self.preview_canvas.pack()
+
+        self.preview_info = tk.Label(
+            preview_outer,
+            text="28 x 28 px",
+            font=("Segoe UI", 9),
+            fg=DIM_TEXT,
+            bg=BG_COLOR,
+        )
+        self.preview_info.pack(pady=(4, 0))
+
+        # Preprocessing stages labels
+        self.stage_label = tk.Label(
+            preview_outer,
+            text="",
+            font=("Segoe UI", 9),
+            fg=DIM_TEXT,
+            bg=BG_COLOR,
+            justify="left",
+            wraplength=PREVIEW_SIZE + 20,
+        )
+        self.stage_label.pack(pady=(8, 0))
 
         # Bind mouse events for drawing
         self.canvas.bind("<B1-Motion>", self._paint)
@@ -175,7 +231,7 @@ class DigitRecognizerApp:
             self.root,
             text="Loading model ...",
             font=("Segoe UI", 10),
-            fg="#6c7086",
+            fg=DIM_TEXT,
             bg=BG_COLOR,
             anchor="w",
         )
@@ -187,7 +243,6 @@ class DigitRecognizerApp:
         x, y = event.x, event.y
 
         if self.last_x is not None and self.last_y is not None:
-            # Draw on tkinter canvas
             self.canvas.create_line(
                 self.last_x, self.last_y, x, y,
                 fill=BRUSH_COLOR,
@@ -195,7 +250,6 @@ class DigitRecognizerApp:
                 capstyle=tk.ROUND,
                 smooth=True,
             )
-            # Draw on PIL mirror
             self.pil_draw.line(
                 [self.last_x, self.last_y, x, y],
                 fill=255,
@@ -211,39 +265,48 @@ class DigitRecognizerApp:
         self.last_y = None
 
     def _clear_canvas(self):
-        """Clear the drawing canvas and result."""
+        """Clear the drawing canvas, preview, and result."""
         self.canvas.delete("all")
+        self.preview_canvas.delete("all")
         self.pil_image = Image.new("L", (CANVAS_SIZE, CANVAS_SIZE), 0)
         self.pil_draw = ImageDraw.Draw(self.pil_image)
         self.result_label.config(text="")
         self.confidence_label.config(text="")
+        self.stage_label.config(text="")
+
+    # -- Preview --------------------------------------------------------
+    def _update_preview(self, img_source):
+        """
+        Run preprocessing and show what the model sees in the preview panel.
+
+        Args:
+            img_source: PIL Image to preprocess and preview.
+        """
+        stages = get_debug_images(img_source)
+        final_28x28 = stages["final"]
+
+        # Upscale 28x28 to PREVIEW_SIZE for display (nearest neighbor to keep sharp)
+        preview_pil = Image.fromarray(final_28x28)
+        preview_pil = preview_pil.resize(
+            (PREVIEW_SIZE, PREVIEW_SIZE), Image.NEAREST
+        )
+
+        self._preview_photo = ImageTk.PhotoImage(preview_pil)
+        self.preview_canvas.delete("all")
+        self.preview_canvas.create_image(
+            0, 0, anchor="nw", image=self._preview_photo
+        )
+
+        # Show preprocessing info
+        cropped_shape = stages["cropped"].shape
+        self.stage_label.config(
+            text=(
+                f"Crop: {cropped_shape[1]}x{cropped_shape[0]}\n"
+                f"Range: [{final_28x28.min()}-{final_28x28.max()}]"
+            )
+        )
 
     # -- Prediction -----------------------------------------------------
-    def _preprocess_image(self, img: Image.Image) -> np.ndarray:
-        """
-        Preprocess a PIL image for MNIST prediction.
-
-        Steps:
-            1. Convert to grayscale
-            2. Invert if background is white
-            3. Resize to 28x28 with anti-aliasing
-            4. Normalize to [0, 1]
-            5. Flatten to (1, 784)
-        """
-        img = img.convert("L")
-
-        # Invert if background is white (MNIST has black background)
-        pixel_mean = np.array(img).mean()
-        if pixel_mean > 127:
-            img = ImageOps.invert(img)
-
-        img = img.resize((MNIST_SIZE, MNIST_SIZE), Image.LANCZOS)
-
-        img_array = np.array(img, dtype="float32") / 255.0
-        img_array = img_array.reshape(1, MNIST_SIZE * MNIST_SIZE)
-
-        return img_array
-
     def _predict(self):
         """Predict the digit drawn on the canvas."""
         if self.model is None:
@@ -253,7 +316,9 @@ class DigitRecognizerApp:
             )
             return
 
-        img_array = self._preprocess_image(self.pil_image)
+        # Use advanced preprocessor
+        img_array = preprocess_drawn_image(self.pil_image, debug=True)
+        self._update_preview(self.pil_image)
         self._run_prediction(img_array)
 
     def _upload_image(self):
@@ -294,12 +359,12 @@ class DigitRecognizerApp:
         self.pil_image = display_img
         self.pil_draw = ImageDraw.Draw(self.pil_image)
 
-        # Show on canvas using PhotoImage
         self._photo = ImageTk.PhotoImage(display_img)
         self.canvas.create_image(0, 0, anchor="nw", image=self._photo)
 
-        # Predict
-        img_array = self._preprocess_image(img)
+        # Use advanced preprocessor on the ORIGINAL image (not display copy)
+        img_array = preprocess_drawn_image(img, debug=True)
+        self._update_preview(img)
         self._run_prediction(img_array)
 
     def _run_prediction(self, img_array: np.ndarray):
